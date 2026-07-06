@@ -1,0 +1,10 @@
+// Skrypt zasobów Windows dla aplikacji Raport Zakupów.
+// Skompilować: brcc32.exe RaportZakupow.rc
+// Powstanie plik RaportZakupow.RES, który Delphi automatycznie linkuje
+// dzięki dyrektywie {$R *.res} w pliku .dpr.
+//
+// Uwaga: Delphi domyślnie używa pliku zasobów o tej samej nazwie co projekt
+// (RaportZakupow.res). Jeśli IDE samo wygeneruje swój RES, ten plik go
+// nadpisze przy ręcznej kompilacji brcc32.
+
+MAINICON ICON "RaportZakupow.ico"
