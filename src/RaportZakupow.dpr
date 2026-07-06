@@ -9,7 +9,7 @@ uses
 begin
   Application.Initialize;
   Application.MainFormOnTaskbar := True;
-  Application.Title := 'Raport zakupów';
+  Application.Title := 'Raport zakupów i sprzedaży';
   Application.CreateForm(TfrmMain, frmMain);
   Application.Run;
 end.

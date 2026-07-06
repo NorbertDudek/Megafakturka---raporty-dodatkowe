@@ -37,7 +37,11 @@ uses
   FireDAC.VCLUI.Wait,
   FireDAC.Comp.Client,
   FireDAC.Comp.DataSet,
-  FireDAC.DApt;
+  FireDAC.DApt,
+  Vcl.Printers,
+  Winapi.ActiveX,
+  System.Win.Registry,
+  SHDocVw;
 
 type
   TfrmMain = class(TForm)
@@ -72,6 +76,9 @@ type
     miLast90: TMenuItem;
     miLast120: TMenuItem;
     FDConn: TFDConnection;
+    lblReportType: TLabel;
+    cmbReportType: TComboBox;
+    btnSavePdf: TButton;
     procedure FormCreate(Sender: TObject);
     procedure FormClose(Sender: TObject; var Action: TCloseAction);
     procedure btnBrowseClick(Sender: TObject);
@@ -80,14 +87,30 @@ type
     procedure btnGenerateClick(Sender: TObject);
     procedure btnSaveClick(Sender: TObject);
     procedure btnOpenBrowserClick(Sender: TObject);
+    procedure btnSavePdfClick(Sender: TObject);
   private
     FLastHTML: string;
+    // Ukryta przeglądarka używana wyłącznie do "cichego" drukowania raportu
+    // do PDF (przez wirtualną drukarkę "Microsoft Print to PDF"). Tworzona
+    // w kodzie (nie w .dfm), żeby uniknąć ręcznego edytowania binarnych
+    // danych ActiveX w pliku formularza.
+    FWebBrowser: TWebBrowser;
+    // Dane firmy - wczytane z tabeli 'Firma' przy połączeniu z bazą,
+    // wykorzystywane w nagłówku obu raportów.
+    FFirmaNazwa, FFirmaUlica, FFirmaNrDomu, FFirmaNrLokalu,
+      FFirmaKodPoczt, FFirmaMiejscowosc, FFirmaNIP: string;
+    FFirmaZaladowana: Boolean;
     function IniFileName: string;
     procedure LoadSettings;
     procedure SaveSettings;
     procedure ConnectToDatabase(const AFileName: string);
+    procedure LoadFirmaData;
     procedure SetRange(ADateFrom, ADateTo: TDateTime);
     function BuildReportHTML(ADateFrom, ADateTo: TDateTime): string;
+    function BuildPurchaseReportHTML(ADateFrom, ADateTo: TDateTime): string;
+    function BuildSalesReportHTML(ADateFrom, ADateTo: TDateTime): string;
+    function ReportFileTag: string;
+    function CompanyHeaderHTML: string;
     procedure SetStatus(const AMsg: string);
   end;
 
@@ -210,6 +233,35 @@ begin
   // Domyślnie - bieżący miesiąc
   SetRange(StartOfTheMonth(Today), EndOfTheMonth(Today));
 
+  // Domyślny typ raportu - zakupy (zachowuje dotychczasowe zachowanie programu).
+  cmbReportType.ItemIndex := 0;
+
+  // Ukryta przeglądarka do drukowania raportu do PDF. Tworzona w kodzie,
+  // z rodzicem ustawionym na formularz, ale niewidoczna i poza obszarem
+  // roboczym - nie jest częścią normalnego interfejsu.
+  FWebBrowser := TWebBrowser.Create(Self);
+  // TWebBrowser (jako kontrolka ActiveX/TOleControl) nie pozwala na
+  // bezpośrednie przypisanie "Parent := ..." przy tworzeniu w runtime
+  // (błąd kompilatora E2129 "Cannot assign to a read-only property").
+  // InsertControl robi dokładnie to samo, czego normalnie użyłoby
+  // przypisanie Parent, tylko bez wywoływania tego konkretnego settera.
+  InsertControl(FWebBrowser);
+  FWebBrowser.Visible := False;
+  FWebBrowser.Left := -3000;
+  FWebBrowser.Top := -3000;
+  // WAŻNE: silnik Trident/MSHTML liczy CSS-owe szerokości procentowe
+  // (nasza tabela ma "width: 100%") względem rozmiaru samej kontrolki
+  // WebBrowser, NIE względem szerokości strony drukarki - nawet przy
+  // druku. Wcześniejszy rozmiar 100x100 px sprawiał, że cała tabela była
+  // fizycznie wyliczona (a potem wydrukowana) jako 100 px szeroka, więc
+  // większość kolumn i tak wychodziła poza tę wąską szerokość i była
+  // ucinana. Ustawiamy więc rozmiar zbliżony do RZECZYWISTEGO obszaru
+  // drukowalnego strony A4 (przy typowym 96 dpi i marginesach 0.4",
+  // wymuszanych w btnSavePdfClick: (8.27" - 2*0.4") * 96 ≈ 750 px),
+  // żeby układ tabeli był liczony względem realistycznej szerokości.
+  FWebBrowser.Width := 750;
+  FWebBrowser.Height := 1060;
+
   // Krok 1: spróbuj odtworzyć ścieżkę z poprzedniego uruchomienia z pliku INI.
   LoadSettings;
 
@@ -221,7 +273,7 @@ begin
       edtFile.Text := DefaultMdb;
   end;
 
-  SetStatus('Gotowy. Wskaż plik bazy i kliknij "Generuj raport".');
+  SetStatus('Gotowy. Plik ustawień: ' + IniFileName + '. Wskaż plik bazy i kliknij "Generuj raport".');
 end;
 
 procedure TfrmMain.FormClose(Sender: TObject; var Action: TCloseAction);
@@ -231,11 +283,14 @@ end;
 
 function TfrmMain.IniFileName: string;
 begin
-  // Plik INI obok exe - wygodne dla aplikacji portable.
-  // Gdyby folder programu był read-only (np. Program Files), można przełączyć na:
-  //   Result := TPath.Combine(GetEnvironmentVariable('APPDATA'),
-  //     'RaportZakupow\RaportZakupow.ini');
-  Result := ChangeFileExt(ParamStr(0), '.ini');
+  // Jeśli program został uruchomiony z parametrem - traktujemy go jako ścieżkę
+  // do pliku INI, który ma być użyty (np. do obsługi kilku różnych baz/firm
+  // z jednego programu, każda z własną konfiguracją).
+  // Bez parametru - używamy domyślnego pliku MFRaporty.ini obok exe.
+  if ParamCount >= 1 then
+    Result := ParamStr(1)
+  else
+    Result := TPath.Combine(ExtractFilePath(ParamStr(0)), 'MFRaporty.ini');
 end;
 
 procedure TfrmMain.LoadSettings;
@@ -263,6 +318,11 @@ begin
     Path := Ini.ReadString('Dialogs', 'SaveInitialDir', '');
     if (Path <> '') and DirectoryExists(Path) then
       dlgSave.InitialDir := Path;
+
+    // Ostatnio wybrany typ raportu (0 = zakupy, 1 = sprzedaż).
+    cmbReportType.ItemIndex := Ini.ReadInteger('Report', 'Type', cmbReportType.ItemIndex);
+    if (cmbReportType.ItemIndex < 0) or (cmbReportType.ItemIndex >= cmbReportType.Items.Count) then
+      cmbReportType.ItemIndex := 0;
   finally
     Ini.Free;
   end;
@@ -280,6 +340,7 @@ begin
       // gdyby ostatnio użyty folder był inny niż aktualnie ustawiony w dialogach.
       Ini.WriteString('Dialogs', 'OpenInitialDir', dlgOpen.InitialDir);
       Ini.WriteString('Dialogs', 'SaveInitialDir', dlgSave.InitialDir);
+      Ini.WriteInteger('Report', 'Type', cmbReportType.ItemIndex);
     finally
       Ini.Free;
     end;
@@ -433,9 +494,60 @@ begin
          IfThen(IsACE, 'ACE (Access 2007+)', 'Jet (Access 2000-2003)'),
          E.Message]);
   end;
+
+  // Wczytaj dane firmy z tabeli 'Firma' - zostaną wykorzystane w nagłówku
+  // obu raportów. Robimy to raz, zaraz po połączeniu, żeby nie odpytywać
+  // bazy przy każdym generowaniu raportu.
+  LoadFirmaData;
 end;
 
-function TfrmMain.BuildReportHTML(ADateFrom, ADateTo: TDateTime): string;
+procedure TfrmMain.LoadFirmaData;
+var
+  q: TFDQuery;
+begin
+  // Resetujemy dane przy każdym (re)połączeniu - żeby dane z poprzednio
+  // otwartej bazy nie "zostały" w nagłówku, gdyby nowa baza nie miała
+  // tabeli 'Firma' albo była pusta.
+  FFirmaNazwa       := '';
+  FFirmaUlica       := '';
+  FFirmaNrDomu      := '';
+  FFirmaNrLokalu    := '';
+  FFirmaKodPoczt    := '';
+  FFirmaMiejscowosc := '';
+  FFirmaNIP         := '';
+  FFirmaZaladowana  := False;
+
+  q := TFDQuery.Create(nil);
+  try
+    q.Connection := FDConn;
+    try
+      q.SQL.Text :=
+        'SELECT Nazwa, ulica, nrdomu, nrlokalu, kodpoczt, miejscowosc, NIP ' +
+        'FROM Firma';
+      q.Open;
+      if not q.Eof then
+      begin
+        FFirmaNazwa       := VarToStrSafe(q.FieldByName('Nazwa').Value);
+        FFirmaUlica       := VarToStrSafe(q.FieldByName('ulica').Value);
+        FFirmaNrDomu      := VarToStrSafe(q.FieldByName('nrdomu').Value);
+        FFirmaNrLokalu    := VarToStrSafe(q.FieldByName('nrlokalu').Value);
+        FFirmaKodPoczt    := VarToStrSafe(q.FieldByName('kodpoczt').Value);
+        FFirmaMiejscowosc := VarToStrSafe(q.FieldByName('miejscowosc').Value);
+        FFirmaNIP         := VarToStrSafe(q.FieldByName('NIP').Value);
+        FFirmaZaladowana  := True;
+      end;
+      q.Close;
+    except
+      // Jeśli tabeli 'Firma' nie ma (albo ma inną strukturę niż oczekiwana) -
+      // nie przerywamy działania programu. Nagłówek raportu po prostu nie
+      // będzie zawierał danych firmy.
+    end;
+  finally
+    q.Free;
+  end;
+end;
+
+function TfrmMain.BuildPurchaseReportHTML(ADateFrom, ADateTo: TDateTime): string;
 const
   // Pobieramy dokumenty zakupowe wraz z pozycjami w jednym zapytaniu
   // (nagłówek wielokrotnie powtarzany jako lewa strona LEFT JOIN-a).
@@ -539,10 +651,14 @@ begin
     SB.AppendLine('  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; color: #222; margin: 20px; }');
     SB.AppendLine('  h1 { font-size: 18px; margin: 0 0 4px 0; }');
     SB.AppendLine('  .meta { color: #666; margin-bottom: 16px; }');
-    SB.AppendLine('  table { border-collapse: collapse; width: 100%; margin-bottom: 18px; }');
-    SB.AppendLine('  th, td { border: 1px solid #d0d0d0; padding: 4px 6px; vertical-align: top; }');
+    // table-layout: fixed + word-wrap - bez tego długi tekst (np. nazwa
+    // towaru albo kontrahenta) potrafi rozciągnąć tabelę szerzej niż
+    // strona, a wtedy druk/PDF przycina wszystko poza prawą krawędzią
+    // zamiast zawijać tekst do kolejnej linii.
+    SB.AppendLine('  table { border-collapse: collapse; width: 100%; max-width: 100%; table-layout: fixed; margin-bottom: 18px; }');
+    SB.AppendLine('  th, td { border: 1px solid #d0d0d0; padding: 4px 6px; vertical-align: top; word-wrap: break-word; overflow-wrap: break-word; word-break: break-word; }');
     SB.AppendLine('  th { background: #f0f0f0; text-align: left; font-weight: 600; }');
-    SB.AppendLine('  td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }');
+    SB.AppendLine('  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }');
     SB.AppendLine('  td.ctr, th.ctr { text-align: center; }');
     // Nagłówek dokumentu - kolor zależy od klasyfikacji K (czerwony) / S (zielony).
     SB.AppendLine('  .doc-head td { font-weight: 600; }');
@@ -577,11 +693,14 @@ begin
     SB.AppendLine('  .pill-warn { background: #ffe9b3; color: #8a5a00; border: 1px solid #f0c860; }');
     SB.AppendLine('  .pill-bad  { background: #fde2e2; color: #b71c1c; border: 1px solid #ef9a9a; }');
     SB.AppendLine('  .pill-info { background: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; }');
+    SB.AppendLine('  .firma { margin-bottom: 14px; line-height: 1.4; }');
+    SB.AppendLine('  .firma-nazwa { font-weight: 700; font-size: 14px; }');
     SB.AppendLine('  @media print { body { margin: 8mm; } .no-print { display: none; } }');
     SB.AppendLine('</style>');
     SB.AppendLine('</head>');
     SB.AppendLine('<body>');
 
+    SB.Append(CompanyHeaderHTML);
     SB.AppendLine('<h1>Raport zakupów (FZ / KFZ)</h1>');
     SB.AppendLine('<div class="meta">Zakres dat wystawienia: <b>' +
       HtmlEscape(FormatDateTime('yyyy-mm-dd', ADateFrom)) + '</b> &ndash; <b>' +
@@ -845,6 +964,222 @@ begin
   end;
 end;
 
+function TfrmMain.BuildSalesReportHTML(ADateFrom, ADateTo: TDateTime): string;
+const
+  // Dokumenty sprzedaży (FV) wraz z ich korektami (KFV). W odróżnieniu od
+  // raportu zakupów (gdzie typ=20/21 zostały ustalone wprost z analizy
+  // bazy), typ dokumentu jest tu rozpoznawany przez JOIN z 'typdok' i filtr
+  // po skrócie - niezależnie od konkretnych numerów id w tej tabeli.
+  // Proformy (FPV) są celowo pominięte - to dokumenty informacyjne, a nie
+  // faktury sprzedaży w rozumieniu VAT.
+  // Filtr: zakres dat wystawienia, status<>1 (nie skasowane).
+  SQL_DOK_SPRZ =
+    'SELECT '+
+    '  d.id       AS d_id, '+
+    '  d.nazwa    AS d_nazwa, '+
+    '  d.wyst     AS d_wyst, '+
+    '  d.nazwak   AS k_nazwa, '+
+    '  d.platnosc AS d_platnosc, '+
+    '  d.netto    AS d_netto, '+
+    '  d.vat      AS d_vat, '+
+    '  d.brutto   AS d_brutto '+
+    'FROM dok d LEFT JOIN typdok td ON td.id = d.typ '+
+    'WHERE td.skrot IN (''FV'', ''KFV'') '+
+    '  AND (d.status IS NULL OR d.status <> 1) '+
+    '  AND d.wyst >= :df AND d.wyst < :dt '+
+    'ORDER BY d.wyst, d.nazwa';
+var
+  qDok: TFDQuery;
+  SB: TStringBuilder;
+  Lp: Integer;
+  TotalNetto, TotalVat, TotalBrutto: Double;
+  NrDok, Kontrahent, PlatnoscOpis: string;
+begin
+  qDok := TFDQuery.Create(nil);
+  SB   := TStringBuilder.Create;
+  try
+    qDok.Connection := FDConn;
+    qDok.SQL.Text := SQL_DOK_SPRZ;
+    qDok.ParamByName('df').AsDateTime := DateOf(ADateFrom);
+    // Górna granica jako "< (data_do + 1 dzień)" - bezpieczne dla dat z czasem.
+    qDok.ParamByName('dt').AsDateTime := DateOf(ADateTo) + 1;
+    qDok.Open;
+
+    TotalNetto  := 0;
+    TotalVat    := 0;
+    TotalBrutto := 0;
+    Lp := 0;
+
+    // ===== HTML =====
+    SB.AppendLine('<!DOCTYPE html>');
+    SB.AppendLine('<html lang="pl">');
+    SB.AppendLine('<head>');
+    SB.AppendLine('<meta charset="UTF-8">');
+    SB.AppendLine('<title>Raport sprzedaży ' +
+      HtmlEscape(FormatDateTime('yyyy-mm-dd', ADateFrom)) + ' - ' +
+      HtmlEscape(FormatDateTime('yyyy-mm-dd', ADateTo)) + '</title>');
+    SB.AppendLine('<style>');
+    SB.AppendLine('  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; color: #222; margin: 20px; }');
+    SB.AppendLine('  h1 { font-size: 18px; margin: 0 0 4px 0; }');
+    SB.AppendLine('  .meta { color: #666; margin-bottom: 16px; }');
+    SB.AppendLine('  table { border-collapse: collapse; width: 100%; max-width: 100%; table-layout: fixed; margin-bottom: 18px; }');
+    SB.AppendLine('  th, td { border: 1px solid #d0d0d0; padding: 4px 8px; vertical-align: top; word-wrap: break-word; overflow-wrap: break-word; word-break: break-word; }');
+    SB.AppendLine('  th { background: #f0f0f0; text-align: left; font-weight: 600; }');
+    SB.AppendLine('  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }');
+    SB.AppendLine('  td.ctr, th.ctr { text-align: center; }');
+    SB.AppendLine('  tr.sum td { font-weight: 700; background: #fff4d6; }');
+    SB.AppendLine('  .empty { color: #999; font-style: italic; padding: 20px; text-align: center; }');
+    SB.AppendLine('  .firma { margin-bottom: 14px; line-height: 1.4; }');
+    SB.AppendLine('  .firma-nazwa { font-weight: 700; font-size: 14px; }');
+    SB.AppendLine('  @media print { body { margin: 8mm; } .no-print { display: none; } }');
+    SB.AppendLine('</style>');
+    SB.AppendLine('</head>');
+    SB.AppendLine('<body>');
+
+    SB.Append(CompanyHeaderHTML);
+    SB.AppendLine('<h1>Raport sprzedaży (FV / KFV)</h1>');
+    SB.AppendLine('<div class="meta">Zakres dat wystawienia: <b>' +
+      HtmlEscape(FormatDateTime('yyyy-mm-dd', ADateFrom)) + '</b> &ndash; <b>' +
+      HtmlEscape(FormatDateTime('yyyy-mm-dd', ADateTo)) + '</b><br>' +
+      'Wygenerowano: ' + HtmlEscape(FormatDateTime('yyyy-mm-dd hh:nn', Now)) + '</div>');
+
+    if qDok.Eof then
+    begin
+      SB.AppendLine('<div class="empty">Brak dokumentów sprzedaży w wybranym zakresie dat.</div>');
+    end
+    else
+    begin
+      SB.AppendLine('<table>');
+      SB.AppendLine('<tr>');
+      SB.AppendLine('  <th class="ctr" style="width:40px">L.p.</th>');
+      SB.AppendLine('  <th>Kontrahent</th>');
+      SB.AppendLine('  <th>Numer faktury</th>');
+      SB.AppendLine('  <th class="ctr">Z dnia</th>');
+      SB.AppendLine('  <th>Forma płatności</th>');
+      SB.AppendLine('  <th class="num">Kwota Netto</th>');
+      SB.AppendLine('  <th class="num">Kwota VAT</th>');
+      SB.AppendLine('  <th class="num">Kwota Brutto</th>');
+      SB.AppendLine('</tr>');
+
+      while not qDok.Eof do
+      begin
+        Inc(Lp);
+
+        NrDok := VarToStrSafe(qDok.FieldByName('d_nazwa').Value);
+        if NrDok = '' then
+          NrDok := '(bez numeru, id=' + IntToStr(qDok.FieldByName('d_id').AsInteger) + ')';
+
+        Kontrahent := VarToStrSafe(qDok.FieldByName('k_nazwa').Value);
+
+        PlatnoscOpis := Trim(VarToStrSafe(qDok.FieldByName('d_platnosc').Value));
+        if PlatnoscOpis = '' then
+          PlatnoscOpis := '(nie określono)';
+
+        SB.AppendLine('<tr>');
+        SB.AppendLine('  <td class="ctr">' + IntToStr(Lp) + '</td>');
+        SB.AppendLine('  <td>' + HtmlEscape(Kontrahent) + '</td>');
+        SB.AppendLine('  <td>' + HtmlEscape(NrDok) + '</td>');
+        if not qDok.FieldByName('d_wyst').IsNull then
+          SB.AppendLine('  <td class="ctr">' +
+            FormatDateTime('yyyy-mm-dd', qDok.FieldByName('d_wyst').AsDateTime) + '</td>')
+        else
+          SB.AppendLine('  <td class="ctr"></td>');
+        SB.AppendLine('  <td>' + HtmlEscape(PlatnoscOpis) + '</td>');
+        SB.AppendLine('  <td class="num">' + FmtMoney(qDok.FieldByName('d_netto').Value) + '</td>');
+        SB.AppendLine('  <td class="num">' + FmtMoney(qDok.FieldByName('d_vat').Value) + '</td>');
+        SB.AppendLine('  <td class="num">' + FmtMoney(qDok.FieldByName('d_brutto').Value) + '</td>');
+        SB.AppendLine('</tr>');
+
+        if not qDok.FieldByName('d_netto').IsNull then
+          TotalNetto := TotalNetto + qDok.FieldByName('d_netto').AsFloat;
+        if not qDok.FieldByName('d_vat').IsNull then
+          TotalVat := TotalVat + qDok.FieldByName('d_vat').AsFloat;
+        if not qDok.FieldByName('d_brutto').IsNull then
+          TotalBrutto := TotalBrutto + qDok.FieldByName('d_brutto').AsFloat;
+
+        qDok.Next;
+      end;
+
+      // Wiersz podsumowania.
+      SB.AppendLine('<tr class="sum">');
+      SB.AppendLine('  <td colspan="5" style="text-align:right">RAZEM (dokumentów: ' +
+        IntToStr(Lp) + '):</td>');
+      SB.AppendLine('  <td class="num">' + FmtMoney(TotalNetto) + '</td>');
+      SB.AppendLine('  <td class="num">' + FmtMoney(TotalVat) + '</td>');
+      SB.AppendLine('  <td class="num">' + FmtMoney(TotalBrutto) + '</td>');
+      SB.AppendLine('</tr>');
+      SB.AppendLine('</table>');
+      SB.AppendLine('<div class="meta">Uwaga: zestawienie obejmuje faktury sprzedaży (FV) oraz ich ' +
+        'korekty (KFV). Proformy (FPV) nie są dokumentami sprzedaży i nie są uwzględniane.</div>');
+    end;
+
+    SB.AppendLine('</body>');
+    SB.AppendLine('</html>');
+
+    Result := SB.ToString;
+  finally
+    qDok.Free;
+    SB.Free;
+  end;
+end;
+
+function TfrmMain.BuildReportHTML(ADateFrom, ADateTo: TDateTime): string;
+begin
+  // cmbReportType.ItemIndex: 0 = zakupy (FZ/KFZ), 1 = sprzedaż (FV/KFV).
+  if cmbReportType.ItemIndex = 1 then
+    Result := BuildSalesReportHTML(ADateFrom, ADateTo)
+  else
+    Result := BuildPurchaseReportHTML(ADateFrom, ADateTo);
+end;
+
+function TfrmMain.ReportFileTag: string;
+begin
+  // Używany do nazw plików/tymczasowych - odróżnia zakupy od sprzedaży.
+  if cmbReportType.ItemIndex = 1 then
+    Result := 'sprzedazy'
+  else
+    Result := 'zakupow';
+end;
+
+function TfrmMain.CompanyHeaderHTML: string;
+var
+  AdresLine: string;
+  SB: TStringBuilder;
+begin
+  Result := '';
+  if not FFirmaZaladowana then
+    Exit;
+  if (FFirmaNazwa = '') and (FFirmaUlica = '') and
+     (FFirmaMiejscowosc = '') and (FFirmaNIP = '') then
+    Exit;
+
+  // Adres sklejony jak w istniejącym raporcie zakupów: "ulica nrdomu/nrlokalu, kod miasto".
+  AdresLine := Trim(FFirmaUlica + ' ' + FFirmaNrDomu);
+  if FFirmaNrLokalu <> '' then
+    AdresLine := AdresLine + '/' + FFirmaNrLokalu;
+  if (FFirmaKodPoczt <> '') or (FFirmaMiejscowosc <> '') then
+  begin
+    if AdresLine <> '' then
+      AdresLine := AdresLine + ', ';
+    AdresLine := AdresLine + Trim(FFirmaKodPoczt + ' ' + FFirmaMiejscowosc);
+  end;
+
+  SB := TStringBuilder.Create;
+  try
+    SB.AppendLine('<div class="firma">');
+    if FFirmaNazwa <> '' then
+      SB.AppendLine('  <div class="firma-nazwa">' + HtmlEscape(FFirmaNazwa) + '</div>');
+    if AdresLine <> '' then
+      SB.AppendLine('  <div>' + HtmlEscape(AdresLine) + '</div>');
+    if FFirmaNIP <> '' then
+      SB.AppendLine('  <div>NIP: ' + HtmlEscape(FFirmaNIP) + '</div>');
+    SB.AppendLine('</div>');
+    Result := SB.ToString;
+  finally
+    SB.Free;
+  end;
+end;
+
 procedure TfrmMain.btnGenerateClick(Sender: TObject);
 var
   D1, D2: TDateTime;
@@ -900,8 +1235,9 @@ begin
     ShowMessage('Najpierw wygeneruj raport.');
     Exit;
   end;
-  dlgSave.FileName := Format('raport_zakupow_%s_%s.html',
-    [FormatDateTime('yyyymmdd', dtpFrom.Date),
+  dlgSave.FileName := Format('raport_%s_%s_%s.html',
+    [ReportFileTag,
+     FormatDateTime('yyyymmdd', dtpFrom.Date),
      FormatDateTime('yyyymmdd', dtpTo.Date)]);
   if dlgSave.Execute then
   begin
@@ -924,9 +1260,209 @@ begin
     Exit;
   end;
   TmpName := TPath.Combine(TPath.GetTempPath,
-    Format('raport_zakupow_%s.html', [FormatDateTime('yyyymmddhhnnss', Now)]));
+    Format('raport_%s_%s.html', [ReportFileTag, FormatDateTime('yyyymmddhhnnss', Now)]));
   TFile.WriteAllText(TmpName, FLastHTML, TEncoding.UTF8);
   ShellExecute(Handle, 'open', PChar(TmpName), nil, nil, SW_SHOWNORMAL);
+end;
+
+{ Zewnętrzna funkcja WinAPI do (tymczasowej) zmiany domyślnej drukarki
+  systemowej. Silnik przeglądarki przy "cichym" drukowaniu (bez okna
+  "Drukuj") zawsze wysyła zadanie na aktualną drukarkę domyślną systemu -
+  dlatego przełączamy ją na czas wydruku na "Microsoft Print to PDF",
+  a zaraz potem przywracamy oryginalną. }
+function SetDefaultPrinterW(pszPrinter: PWideChar): BOOL; stdcall;
+  external 'winspool.drv' name 'SetDefaultPrinterW';
+
+type
+  // Prosta pomoc do bezpiecznego backupu/przywracania pojedynczej wartości
+  // rejestru - pamięta też, czy wartość w ogóle istniała wcześniej (żeby po
+  // przywróceniu nie zostawić czegoś, czego wcześniej nie było).
+  TRegBackupValue = record
+    Existed: Boolean;
+    Value: string;
+  end;
+
+function BackupRegString(Reg: TRegistry; const AValueName: string): TRegBackupValue;
+begin
+  Result.Existed := Reg.ValueExists(AValueName);
+  if Result.Existed then
+    Result.Value := Reg.ReadString(AValueName)
+  else
+    Result.Value := '';
+end;
+
+procedure RestoreRegString(Reg: TRegistry; const AValueName: string; const ABackup: TRegBackupValue);
+begin
+  if ABackup.Existed then
+    Reg.WriteString(AValueName, ABackup.Value)
+  else if Reg.ValueExists(AValueName) then
+    Reg.DeleteValue(AValueName);
+end;
+
+procedure TfrmMain.btnSavePdfClick(Sender: TObject);
+const
+  DM_PAPERSIZE = $0002;
+  DMPAPER_A4   = 9;
+  PDF_PRINTER_NAME = 'Microsoft Print to PDF';
+  MAX_WAIT_MS = 10000;
+  // Klucz rejestru używany przez silnik Trident/MSHTML (a więc i przez
+  // TWebBrowser) do ustawień marginesów oraz nagłówka/stopki wydruku -
+  // to te same ustawienia, które w starym Internet Explorerze były
+  // dostępne w oknie "Ustawienia strony".
+  IE_PAGESETUP_KEY = 'Software\Microsoft\Internet Explorer\PageSetup';
+var
+  TmpHtml: string;
+  PdfIdx: Integer;
+  OldPrinterName: string;
+  Device, Driver, Port: string;
+  hDMode: THandle;
+  DevModeData: PDeviceMode;
+  StartTick: Cardinal;
+  vIn, vOut: OleVariant;
+  Reg: TRegistry;
+  HasPageSetupKey: Boolean;
+  BakMarginL, BakMarginT, BakMarginR, BakMarginB, BakHeader, BakFooter: TRegBackupValue;
+begin
+  if FLastHTML = '' then
+  begin
+    ShowMessage('Najpierw wygeneruj raport.');
+    Exit;
+  end;
+
+  PdfIdx := Printer.Printers.IndexOf(PDF_PRINTER_NAME);
+  if PdfIdx < 0 then
+  begin
+    MessageDlg(
+      'Nie znaleziono drukarki wirtualnej "' + PDF_PRINTER_NAME + '".'#13#10#13#10 +
+      'W Windows 10/11 jest ona zwykle wbudowana - włącz ją w:'#13#10 +
+      'Ustawienia -> Drukarki i skanery -> Dodaj urządzenie'#13#10 +
+      '(albo: Panel sterowania -> Programy i funkcje -> Włącz/wyłącz funkcje ' +
+      'systemu Windows -> "Microsoft Print to PDF").',
+      mtError, [mbOK], 0);
+    Exit;
+  end;
+
+  Screen.Cursor := crHourGlass;
+  SetStatus('Przygotowywanie pliku PDF...');
+  Reg := TRegistry.Create;
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    HasPageSetupKey := Reg.OpenKey(IE_PAGESETUP_KEY, True);
+    if HasPageSetupKey then
+    begin
+      // Zapamiętaj obecne ustawienia, żeby przywrócić je dokładnie takimi,
+      // jakie były (albo usunąć, jeśli wcześniej ich nie było).
+      BakMarginL := BackupRegString(Reg, 'margin_left');
+      BakMarginT := BackupRegString(Reg, 'margin_top');
+      BakMarginR := BackupRegString(Reg, 'margin_right');
+      BakMarginB := BackupRegString(Reg, 'margin_bottom');
+      BakHeader  := BackupRegString(Reg, 'header');
+      BakFooter  := BackupRegString(Reg, 'footer');
+
+      // Zmniejsz marginesy (domyślnie 0.75") i wyczyść nagłówek/stopkę
+      // (domyślnie tytuł+data u góry, adres URL na dole) - inaczej te
+      // marginesy razem z szeroką tabelą raportu łatwo powodują ucięcie
+      // prawej krawędzi na wydruku/PDF.
+      Reg.WriteString('margin_left', '0.4');
+      Reg.WriteString('margin_top', '0.4');
+      Reg.WriteString('margin_right', '0.4');
+      Reg.WriteString('margin_bottom', '0.4');
+      Reg.WriteString('header', '');
+      Reg.WriteString('footer', '');
+    end;
+
+    try
+      // Zapisz raport do pliku tymczasowego - tak samo jak przy "Otwórz w przeglądarce".
+      TmpHtml := TPath.Combine(TPath.GetTempPath,
+        Format('raport_%s_%s.html', [ReportFileTag, FormatDateTime('yyyymmddhhnnss', Now)]));
+      TFile.WriteAllText(TmpHtml, FLastHTML, TEncoding.UTF8);
+
+      // Zapamiętaj bieżącą drukarkę domyślną, żeby przywrócić ją po wydruku.
+      OldPrinterName := '';
+      if Printer.Printers.Count > 0 then
+        OldPrinterName := Printer.Printers[Printer.PrinterIndex];
+
+      if not SetDefaultPrinterW(PWideChar(WideString(PDF_PRINTER_NAME))) then
+        raise Exception.Create('Nie udało się ustawić "' + PDF_PRINTER_NAME +
+          '" jako drukarki domyślnej.');
+      Printer.PrinterIndex := PdfIdx;
+
+      try
+        // Wymuś format A4 dla tego wydruku - niezależnie od domyślnego ustawienia
+        // sterownika/systemu (które bywa np. Letter na anglojęzycznych Windows).
+        Printer.GetPrinter(Device, Driver, Port, hDMode);
+        if hDMode <> 0 then
+        begin
+          DevModeData := GlobalLock(hDMode);
+          try
+            if Assigned(DevModeData) then
+            begin
+              DevModeData^.dmFields := DevModeData^.dmFields or DM_PAPERSIZE;
+              DevModeData^.dmPaperSize := DMPAPER_A4;
+            end;
+          finally
+            GlobalUnlock(hDMode);
+          end;
+          Printer.SetPrinter(Device, Driver, Port, hDMode);
+        end;
+
+        // Załaduj raport w ukrytej przeglądarce i poczekaj na pełne wczytanie
+        // (drukowanie przed zakończeniem ładowania dałoby pusty/urwany wydruk).
+        FWebBrowser.Navigate(TmpHtml);
+        StartTick := GetTickCount;
+        while (FWebBrowser.ReadyState <> READYSTATE_COMPLETE) and
+              (GetTickCount - StartTick < MAX_WAIT_MS) do
+          Application.ProcessMessages;
+
+        // Drukuj "cicho" (bez okna dialogowego "Drukuj" przeglądarki) - sterownik
+        // "Microsoft Print to PDF" i tak pokaże własne systemowe okno "Zapisz
+        // wynik drukowania jako", w którym wskazuje się docelowy plik .pdf.
+        SetStatus('Wskaż plik docelowy w oknie "Zapisz wynik drukowania jako"...');
+        vIn := Unassigned;
+        vOut := Unassigned;
+        FWebBrowser.ExecWB(OLECMDID_PRINT, OLECMDEXECOPT_DONTPROMPTUSER, vIn, vOut);
+
+        // WAŻNE: ExecWB wraca ze sterowaniem niemal natychmiast - samo
+        // wysłanie zadania do spoolera (i wybranie AKTUALNEJ drukarki
+        // domyślnej) dzieje się chwilę później, asynchronicznie. Jeśli
+        // przywrócimy poprzednią drukarkę domyślną zbyt szybko, zadanie
+        // "ucieknie" na starą drukarkę zamiast na "Microsoft Print to PDF" -
+        // to najczęstsza przyczyna, gdy drukowanie mimo wszystko trafia na
+        // drukarkę domyślną sprzed uruchomienia funkcji. Dajemy więc
+        // spoolerowi margines czasu, zanim cokolwiek przywrócimy.
+        StartTick := GetTickCount;
+        while GetTickCount - StartTick < 5000 do
+          Application.ProcessMessages;
+      finally
+        // Przywróć poprzednią drukarkę domyślną, niezależnie od wyniku.
+        if OldPrinterName <> '' then
+          SetDefaultPrinterW(PWideChar(WideString(OldPrinterName)));
+      end;
+
+      SetStatus('Gotowe. Zapisz plik w oknie "Zapisz wynik drukowania jako", jeśli się pojawiło.');
+    except
+      on E: Exception do
+      begin
+        SetStatus('Błąd: ' + E.Message);
+        MessageDlg('Błąd podczas zapisywania do PDF:'#13#10 + E.Message, mtError, [mbOK], 0);
+      end;
+    end;
+  finally
+    // Przywróć oryginalne ustawienia marginesów/nagłówka/stopki, niezależnie
+    // od tego, czy wydruk się powiódł.
+    if HasPageSetupKey then
+    begin
+      RestoreRegString(Reg, 'margin_left', BakMarginL);
+      RestoreRegString(Reg, 'margin_top', BakMarginT);
+      RestoreRegString(Reg, 'margin_right', BakMarginR);
+      RestoreRegString(Reg, 'margin_bottom', BakMarginB);
+      RestoreRegString(Reg, 'header', BakHeader);
+      RestoreRegString(Reg, 'footer', BakFooter);
+      Reg.CloseKey;
+    end;
+    Reg.Free;
+  end;
+  Screen.Cursor := crDefault;
 end;
 
 end.

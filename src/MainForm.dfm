@@ -1,9 +1,9 @@
 object frmMain: TfrmMain
   Left = 0
   Top = 0
-  Caption = 'Raport zakup'#243'w (FZ / KFZ)'
+  Caption = 'Raport zakup'#243'w i sprzeda'#380'y'
   ClientHeight = 640
-  ClientWidth = 1000
+  ClientWidth = 1090
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
@@ -17,8 +17,8 @@ object frmMain: TfrmMain
   object pnlTop: TPanel
     Left = 0
     Top = 0
-    Width = 1000
-    Height = 105
+    Width = 1090
+    Height = 138
     Align = alTop
     BevelOuter = bvNone
     Padding.Left = 10
@@ -46,6 +46,13 @@ object frmMain: TfrmMain
       Width = 18
       Height = 15
       Caption = 'Do:'
+    end
+    object lblReportType: TLabel
+      Left = 14
+      Top = 87
+      Width = 63
+      Height = 15
+      Caption = 'Typ raportu:'
     end
     object edtFile: TEdit
       Left = 90
@@ -118,24 +125,44 @@ object frmMain: TfrmMain
       TabOrder = 7
       OnClick = btnOpenBrowserClick
     end
+    object btnSavePdf: TButton
+      Left = 916
+      Top = 46
+      Width = 150
+      Height = 25
+      Caption = 'Zapisz jako PDF (A4)'
+      TabOrder = 10
+      OnClick = btnSavePdfClick
+    end
+    object cmbReportType: TComboBox
+      Left = 110
+      Top = 83
+      Width = 250
+      Height = 23
+      Style = csDropDownList
+      TabOrder = 8
+      Items.Strings = (
+        'Zakupy (FZ / KFZ)'
+        'Sprzeda'#380' (FV / KFV)')
+    end
     object pnlStatus: TPanel
       Left = 10
-      Top = 80
-      Width = 980
+      Top = 113
+      Width = 1070
       Height = 17
       Align = alBottom
       Alignment = taLeftJustify
       BevelOuter = bvNone
       Caption = '   Gotowy.'
       ParentBackground = False
-      TabOrder = 8
+      TabOrder = 9
     end
   end
   object memHTML: TMemo
     Left = 0
-    Top = 105
-    Width = 1000
-    Height = 535
+    Top = 138
+    Width = 1090
+    Height = 502
     Align = alClient
     Font.Charset = DEFAULT_CHARSET
     Font.Color = clWindowText
